@@ -24,6 +24,9 @@ from typing import Dict, List, Optional, Set, Union
 
 logger = logging.getLogger(__name__)
 
+# Default timeout (seconds) for remote data fetches to avoid hanging indefinitely
+REQUEST_TIMEOUT = 30
+
 
 def geo_damerau_levenshtein_distance(val1, val2):
     return min(
@@ -116,7 +119,7 @@ class ShapeManager(object):
             }
 
     def get_quote_location_by_reference_code(self, reference_code):
-        shape = self.get_shape_by_ref_code(reference_code=reference_code)
+        shape = self.get_shape_by_ref_code(reference_code=reference_code) or {}
         ref_data = shape.get('ref_data') or {}
         return {
             'zip_code': ref_data.get('zip_code'),
@@ -152,7 +155,7 @@ class ShapeManager(object):
         """
         Get Current Time for Shape by Reference Code
         """
-        shape_obj = self.get_shape_by_ref_code(reference_code=reference_code)
+        shape_obj = self.get_shape_by_ref_code(reference_code=reference_code) or {}
         if shape_obj.get('primary_timezone') is None:
             return datetime.now()
         return datetime.now().astimezone(tz=pytz.timezone(shape_obj.get('primary_timezone')))
@@ -303,11 +306,15 @@ class RadiusSearchManager(object):
             ]
 
             # Add Distance
+            results = []
             for shape_obj in shape_obj_ls:
+                # `get_shape_by_id` may return None for a stale/unknown id
+                if shape_obj is None:
+                    continue
                 if reference_code:
-                    shape_obj.update({
-                        "distance": self.get_shape_pair_distance(reference_code, shape_obj["reference_code"])
-                    })
+                    distance = self.get_shape_pair_distance(
+                        reference_code, shape_obj["reference_code"]
+                    )
                 else:
                     raw_distance = round(lat_lng_dist(
                         lat_lng_1=(latitude, longitude),
@@ -318,9 +325,11 @@ class RadiusSearchManager(object):
                         "normalized_distance": raw_distance,
                         "aggregate": True
                     }
-                    shape_obj.update({"distance": distance})
+                # Shallow-copy so the per-request `distance` is not written back
+                # onto the shared canonical shape dict held in `geo_shape_dict`.
+                results.append({**shape_obj, "distance": distance})
 
-            return shape_obj_ls
+            return results
 
         return shape_id_ls
 
@@ -386,7 +395,23 @@ class RadiusSearchManager(object):
         if not orig_shape.is_aggregate and not dest_shape.is_aggregate:
             return {'distance': distance, 'normalized_distance': distance, 'aggregate': False}
 
-        # Aggregate Location distance
+        # Both Areas Aggregates -> normalize by the mean of the two areas.
+        # Checked first so this branch is actually reachable; otherwise a leading
+        # `if orig_shape.is_aggregate` would swallow every both-aggregate pair.
+        if orig_shape.is_aggregate and dest_shape.is_aggregate:
+            if orig_shape.area < 10 or dest_shape.area < 10:
+                return {
+                    'distance': distance,
+                    'normalized_distance': distance,
+                    'aggregate': True
+                }
+            return {
+                'distance': distance,
+                'normalized_distance': distance / log(max(mean([orig_shape.area, dest_shape.area]), 1)),
+                'aggregate': True
+            }
+
+        # Single Aggregate Location distance
         if orig_shape.is_aggregate:
             if orig_shape.area < 10:
                 return {
@@ -399,7 +424,7 @@ class RadiusSearchManager(object):
                 'normalized_distance': distance / log(max(orig_shape.area, 1)),
                 'aggregate': True
             }
-        elif dest_shape.is_aggregate:
+        else:  # dest_shape.is_aggregate
             if dest_shape.area < 10:
                 return {
                     'distance': distance,
@@ -409,19 +434,6 @@ class RadiusSearchManager(object):
             return {
                 'distance': distance,
                 'normalized_distance': distance / log(max(dest_shape.area, 1)),
-                'aggregate': True
-            }
-        else:
-            # Both Areas Aggregates
-            if orig_shape.area < 10 or dest_shape.area < 10:
-                return {
-                    'distance': distance,
-                    'normalized_distance': distance,
-                    'aggregate': True
-                }
-            return {
-                'distance': distance,
-                'normalized_distance': distance / log(max(mean(orig_shape.area, dest_shape.area), 1)),
                 'aggregate': True
             }
 
@@ -479,6 +491,8 @@ class NgramSearchManager(object):
         source_ngram_ls = ngrams(source_str, 3)
         difference_num_ngrams = len(set(search_ngram_ls).symmetric_difference(set(source_ngram_ls)))
         num_search_ngrams = len(set(search_ngram_ls))
+        if num_search_ngrams == 0:
+            return 0.0
         return 1 - (difference_num_ngrams / num_search_ngrams)
 
     def entity_fuzzy_score(self, search_str: str, source_str: str) -> float:
@@ -554,7 +568,9 @@ class NgramSearchManager(object):
                 Counter([y for x in search_res.values() for y in x]).most_common(max(num_results, 500))
             )
             results = {
-                self.geo_shape_dict[partition].get(key, {}).get('clean_value') : {
+                # Key on the unique entity id, not `clean_value`; distinct shapes
+                # sharing a display name (or a missing clean_value) must not collapse.
+                key : {
                     'value': self.geo_shape_dict.get(key, {}).get('value'),
                     'clean_value': self.geo_shape_dict[partition].get(key, {}).get('clean_value'),
                     'distance': geo_damerau_levenshtein_distance(
@@ -585,7 +601,9 @@ class NgramSearchManager(object):
                 Counter([y for x in search_res.values() for y in x]).most_common(max(num_results, 500))
             )
             results = {
-                self.geo_shape_dict.get(key, {}).get('clean_value') : {
+                # Key on the unique entity id, not `clean_value`; distinct shapes
+                # sharing a display name (or a missing clean_value) must not collapse.
+                key : {
                     'value': self.geo_shape_dict.get(key, {}).get('value'),
                     'clean_value': self.geo_shape_dict.get(key, {}).get('clean_value'),
                     'distance': geo_damerau_levenshtein_distance(
@@ -647,9 +665,12 @@ class GeoManager(ShapeManager, RadiusSearchManager, NgramSearchManager):
         self._generate_maps()
 
     def _generate_maps(self):
-        # Map Between IDs and Refence
+        # Map Between IDs and Reference. Skip malformed records missing either key
+        # rather than aborting the whole load on a single bad record.
         self.id_reference_code_map = {
-            record['id']: record['reference_code'] for record in self.geo_shape_dict.values()
+            record['id']: record['reference_code']
+            for record in self.geo_shape_dict.values()
+            if record.get('id') is not None and record.get('reference_code') is not None
         }
         for value in self.geo_shape_dict.values():
             try:
@@ -657,12 +678,24 @@ class GeoManager(ShapeManager, RadiusSearchManager, NgramSearchManager):
                     'latitude': float(value['latitude']),
                     'longitude': float(value['longitude'])
                 })
-            except KeyError:
-                logger.error(f'[GeoManager] `_generate_maps` key error', exc_info=True)
+            except (KeyError, TypeError, ValueError):
+                logger.error(
+                    '[GeoManager] `_generate_maps` unable to coerce coordinates',
+                    exc_info=True
+                )
 
-        self.radius_search_map = {
-            ref_code: RadiusSearchShape(record) for ref_code, record in self.geo_shape_dict.items()
-        }
+        # Build the radius-search map, skipping records that cannot be turned into
+        # a `RadiusSearchShape` (missing id/coords/area, non-numeric values) so a
+        # single malformed record does not abort the entire data load.
+        self.radius_search_map = {}
+        for ref_code, record in self.geo_shape_dict.items():
+            try:
+                self.radius_search_map[ref_code] = RadiusSearchShape(record)
+            except (KeyError, TypeError, ValueError):
+                logger.error(
+                    f'[GeoManager] `_generate_maps` skipping malformed record ref_code=`{ref_code}`',
+                    exc_info=True
+                )
 
     @property
     def num_shapes(self):
@@ -705,12 +738,19 @@ class GeoManager(ShapeManager, RadiusSearchManager, NgramSearchManager):
         
         # Load Local
         local_path = os.path.join(self.data_dir, "geo_db", version or "current")
-        if os.path.exists(local_path) and not force_db_fetch:
+        local_search_path = os.path.join(local_path, search_file_name)
+        local_geo_shape_path = os.path.join(local_path, geo_shape_file_name)
+        # Require BOTH cached files to exist; a partial cache dir (e.g. an
+        # interrupted prior write) must fall through to a remote fetch.
+        local_cache_available = (
+            os.path.exists(local_search_path) and os.path.exists(local_geo_shape_path)
+        )
+        if local_cache_available and not force_db_fetch:
             logger.info("Starting Loading Data from Local")
-            with open(os.path.join(local_path, search_file_name), 'r') as f:
+            with open(local_search_path, 'r') as f:
                 self.search_dict = json.load(f)
 
-            with open(os.path.join(local_path, geo_shape_file_name), 'r') as f:
+            with open(local_geo_shape_path, 'r') as f:
                 self.geo_shape_dict = json.load(f)
 
             # Radius Search
@@ -722,7 +762,8 @@ class GeoManager(ShapeManager, RadiusSearchManager, NgramSearchManager):
         # Load Search File
         logger.info("Starting Loading Data from Remote")
         response = requests.get(
-            f'{self.get_base_url(version=version)}{fetch_search_file_name}'
+            f'{self.get_base_url(version=version)}{fetch_search_file_name}',
+            timeout=REQUEST_TIMEOUT
         )
         if response.status_code == 200:
             if compressed:
@@ -735,8 +776,11 @@ class GeoManager(ShapeManager, RadiusSearchManager, NgramSearchManager):
             raise ValueError(f"Unable to load search file reason={response.text}")
 
         # Load Shape File
-        response = requests.get(f'{self.get_base_url(version=version)}{fetch_geo_shape_file_name}')
-        if response.status_code == 200: 
+        response = requests.get(
+            f'{self.get_base_url(version=version)}{fetch_geo_shape_file_name}',
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code == 200:
             if compressed:
                 self.geo_shape_dict = json.loads(
                     gzip.decompress(response.content).decode("utf-8")
