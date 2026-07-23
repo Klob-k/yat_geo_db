@@ -14,13 +14,13 @@ def tversky_index(text1, text2, a=None, b=None, q=3, pad=True):
     v1 = len(ngram1) - agree_tot
     v2 = len(ngram2) - agree_tot
 
-    if a != None and b != None:
-        a = a/float(a+b)
-        b = b/float(a+b)
-    elif a <= 1.0 and a >= 0.0:
-        b = 1-a
-    elif b <= 1.0 and b >= 0.0:
-        a = 1-b
+    if a is not None and b is not None:
+        total = float(a + b)
+        a, b = a / total, b / total
+    elif a is not None and 0.0 <= a <= 1.0:
+        b = 1 - a
+    elif b is not None and 0.0 <= b <= 1.0:
+        a = 1 - b
     else:
         a = 0.5
         b = 0.5
